@@ -1,510 +1,527 @@
 """
 Vercel API Manager Bot
-A Telegram bot to manage Vercel AI Gateway API keys
-with per-user encryption and access control.
+Telegram bot to manage Vercel AI Gateway API keys.
 
-Storage: Upstash Redis (REST API) — serverless-friendly, no persistent connection.
-Security: Per-user AES-256 encryption via HMAC-derived keys (Fernet).
-Access: Allowlist via ALLOWED_TELEGRAM_USERS env var.
+Architecture:
+- Storage : Upstash Redis via REST API (serverless-safe, no persistent TCP)
+- Encryption: Per-user AES-256 (Fernet) keys derived via HMAC-SHA256
+- Access   : Username allowlist via ALLOWED_TELEGRAM_USERS env var
+- Auto-del : Deferred deletes stored in Redis queue, executed by run_pending_tasks()
 """
 
+from __future__ import annotations
 import os
 import json
 import asyncio
 import hashlib
 import hmac
 import base64
-import httpx
+import time
 from typing import Optional, List, Dict, Any
+
+import httpx
 from cryptography.fernet import Fernet
 
 
-# ─────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ALLOWED_USERS_RAW = os.environ.get("ALLOWED_TELEGRAM_USERS", "")
-ALLOWED_USERS = {u.strip().lower().lstrip("@") for u in ALLOWED_USERS_RAW.split(",") if u.strip()}
+# ───────────────────────────────────────────────────────
+# Config
+# ───────────────────────────────────────────────────────
+BOT_TOKEN       = os.environ["TELEGRAM_BOT_TOKEN"]
+MASTER_KEY      = os.environ["MASTER_ENCRYPTION_KEY"]
+ALLOWED_RAW     = os.environ.get("ALLOWED_TELEGRAM_USERS", "")
+ALLOWED_USERS   = {u.strip().lower().lstrip("@") for u in ALLOWED_RAW.split(",") if u.strip()}
 
-MASTER_ENCRYPTION_KEY = os.environ["MASTER_ENCRYPTION_KEY"]
+# Upstash / Vercel KV REST (works in serverless — no persistent socket)
+KV_URL   = (os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("KV_REST_API_URL", "")).rstrip("/")
+KV_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("KV_REST_API_TOKEN", "")
 
-# Upstash / Vercel KV REST API (serverless-compatible)
-# Supports both Vercel KV naming and Upstash naming conventions
-UPSTASH_REDIS_REST_URL = (
-    os.environ.get("UPSTASH_REDIS_REST_URL") or
-    os.environ.get("KV_REST_API_URL") or
-    ""
-)
-UPSTASH_REDIS_REST_TOKEN = (
-    os.environ.get("UPSTASH_REDIS_REST_TOKEN") or
-    os.environ.get("KV_REST_API_TOKEN") or
-    ""
-)
+TG_API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
+GATEWAY_URL  = "https://ai-gateway.vercel.sh/v1"
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-VERCEL_GATEWAY = "https://ai-gateway.vercel.sh/v1"
-
-AUTO_DELETE_SECONDS = 30
+AUTO_DEL_SEC = 30   # seconds before auto-deleting output messages
+ADD_DEL_SEC  = 3    # seconds before deleting "done" confirmation after add
 
 
-# ─────────────────────────────────────────────
-# Upstash Redis REST Client (no persistent conn)
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
+# Upstash Redis REST helpers  (GET /COMMAND/arg1/arg2…)
+# ───────────────────────────────────────────────────────
 
-async def _upstash(command: list) -> Any:
+async def _kv(command: list[str]) -> Any:
     """Execute a Redis command via Upstash REST API."""
-    url = f"{UPSTASH_REDIS_REST_URL.rstrip('/')}/{'/'.join(str(c) for c in command)}"
+    url = KV_URL + "/" + "/".join(
+        # URL-encode each part so values with special chars are safe
+        str(c).replace("/", "%2F").replace(" ", "%20")
+        for c in command
+    )
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"},
-        )
-        data = resp.json()
-        if "error" in data:
-            raise RuntimeError(f"Redis error: {data['error']}")
-        return data.get("result")
+        resp = await client.get(url, headers={"Authorization": f"Bearer {KV_TOKEN}"})
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"KV error: {data['error']}")
+    return data.get("result")
 
 
 async def kv_get(key: str) -> Optional[str]:
-    result = await _upstash(["GET", key])
-    return result
+    return await _kv(["GET", key])
 
+async def kv_set(key: str, val: str) -> None:
+    await _kv(["SET", key, val])
 
-async def kv_set(key: str, value: str) -> None:
-    await _upstash(["SET", key, value])
-
-
-async def kv_setex(key: str, ttl: int, value: str) -> None:
-    await _upstash(["SETEX", key, str(ttl), value])
-
+async def kv_setex(key: str, ttl: int, val: str) -> None:
+    await _kv(["SETEX", key, str(ttl), val])
 
 async def kv_del(key: str) -> None:
-    await _upstash(["DEL", key])
+    await _kv(["DEL", key])
+
+async def kv_lpush(key: str, val: str) -> None:
+    await _kv(["LPUSH", key, val])
+
+async def kv_lrange(key: str, start: int, stop: int) -> list:
+    result = await _kv(["LRANGE", key, str(start), str(stop)])
+    return result or []
+
+async def kv_delete(key: str) -> None:
+    await _kv(["DEL", key])
 
 
-# ─────────────────────────────────────────────
-# Per-User Encryption
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
+# Per-user encryption  (HMAC-derived Fernet key)
+# ───────────────────────────────────────────────────────
 
-def _derive_user_key(username: str) -> bytes:
-    """Derive a unique Fernet-compatible key per user using HMAC-SHA256."""
-    master = MASTER_ENCRYPTION_KEY.encode()
-    user_bytes = username.lower().encode()
-    derived = hmac.HMAC(master, user_bytes, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(derived)
-
-
-def encrypt_value(username: str, plaintext: str) -> str:
-    fernet = Fernet(_derive_user_key(username))
-    return fernet.encrypt(plaintext.encode()).decode()
+def _user_fernet(username: str) -> Fernet:
+    derived = hmac.new(
+        MASTER_KEY.encode(),
+        username.lower().encode(),
+        hashlib.sha256,
+    ).digest()
+    return Fernet(base64.urlsafe_b64encode(derived))
 
 
-def decrypt_value(username: str, ciphertext: str) -> str:
-    fernet = Fernet(_derive_user_key(username))
-    return fernet.decrypt(ciphertext.encode()).decode()
+def enc(username: str, plaintext: str) -> str:
+    return _user_fernet(username).encrypt(plaintext.encode()).decode()
+
+def dec(username: str, ciphertext: str) -> str:
+    return _user_fernet(username).decrypt(ciphertext.encode()).decode()
 
 
-# ─────────────────────────────────────────────
-# Data Layer - isolated per user
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
+# Redis key helpers  (user-isolated, hash-based)
+# ───────────────────────────────────────────────────────
 
-def _user_hash(username: str) -> str:
+def _uh(username: str) -> str:
+    """Short user hash for Redis key namespacing."""
     return hashlib.sha256(username.lower().encode()).hexdigest()[:16]
 
-
-def _keys_redis_key(username: str) -> str:
-    return f"vam:keys:{_user_hash(username)}"
-
-
-def _state_redis_key(username: str) -> str:
-    return f"vam:state:{_user_hash(username)}"
+def _kkeys(u: str)  -> str: return f"vam:keys:{_uh(u)}"
+def _kstate(u: str) -> str: return f"vam:state:{_uh(u)}"
+def _kdq(u: str)    -> str: return f"vam:delq:{_uh(u)}"   # delete queue
 
 
-async def get_user_keys(username: str) -> List[str]:
-    """Return all decrypted API keys for the user."""
-    raw = await kv_get(_keys_redis_key(username))
+# ───────────────────────────────────────────────────────
+# API key storage
+# ───────────────────────────────────────────────────────
+
+async def get_keys(username: str) -> List[str]:
+    raw = await kv_get(_kkeys(username))
     if not raw:
         return []
-    encrypted_list: List[str] = json.loads(raw)
-    return [decrypt_value(username, e) for e in encrypted_list]
+    return [dec(username, e) for e in json.loads(raw)]
 
+async def save_keys(username: str, keys: List[str]) -> None:
+    await kv_set(_kkeys(username), json.dumps([enc(username, k) for k in keys]))
 
-async def save_user_keys(username: str, keys: List[str]) -> None:
-    """Encrypt and persist the key list."""
-    encrypted_list = [encrypt_value(username, k) for k in keys]
-    await kv_set(_keys_redis_key(username), json.dumps(encrypted_list))
-
-
-async def add_user_key(username: str, api_key: str) -> bool:
-    keys = await get_user_keys(username)
-    if api_key in keys:
+async def add_key(username: str, key: str) -> bool:
+    keys = await get_keys(username)
+    if key in keys:
         return False
-    keys.append(api_key)
-    await save_user_keys(username, keys)
+    keys.append(key)
+    await save_keys(username, keys)
+    return True
+
+async def remove_key(username: str, key: str) -> bool:
+    keys = await get_keys(username)
+    if key not in keys:
+        return False
+    keys.remove(key)
+    await save_keys(username, keys)
     return True
 
 
-async def remove_user_key(username: str, api_key: str) -> bool:
-    keys = await get_user_keys(username)
-    if api_key not in keys:
-        return False
-    keys.remove(api_key)
-    await save_user_keys(username, keys)
-    return True
+# ───────────────────────────────────────────────────────
+# State machine
+# ───────────────────────────────────────────────────────
+
+async def set_state(username: str, state: str) -> None:
+    await kv_setex(_kstate(username), 300, state)
+
+async def get_state(username: str) -> Optional[str]:
+    return await kv_get(_kstate(username))
+
+async def clear_state(username: str) -> None:
+    await kv_del(_kstate(username))
 
 
-# ─────────────────────────────────────────────
-# State Machine (await input from user)
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
+# Delete queue  (schedule messages for later deletion)
+# Stored as JSON: {chat_id, message_id, delete_at}
+# ───────────────────────────────────────────────────────
 
-async def set_user_state(username: str, state: str) -> None:
-    await kv_setex(_state_redis_key(username), 300, state)
-
-
-async def get_user_state(username: str) -> Optional[str]:
-    return await kv_get(_state_redis_key(username))
-
-
-async def clear_user_state(username: str) -> None:
-    await kv_del(_state_redis_key(username))
+async def schedule_delete(username: str, chat_id: int, message_ids: List[int], delay: int) -> None:
+    """Push deletion tasks into Redis for run_pending_tasks() to execute."""
+    delete_at = int(time.time()) + delay
+    for mid in message_ids:
+        entry = json.dumps({"chat_id": chat_id, "message_id": mid, "delete_at": delete_at})
+        await kv_lpush(_kdq(username), entry)
 
 
-# ─────────────────────────────────────────────
-# Vercel AI Gateway - Balance API
-# ─────────────────────────────────────────────
+# Global delete queue used within a single request (non-serverless tasks).
+_pending_deletes: List[Dict] = []
+
+def queue_delete(chat_id: int, message_ids: List[int], delay: int) -> None:
+    """Queue in-process deletion (for background within same request)."""
+    delete_at = time.time() + delay
+    for mid in message_ids:
+        _pending_deletes.append({"chat_id": chat_id, "message_id": mid, "delete_at": delete_at})
+
+
+async def run_pending_tasks() -> None:
+    """
+    Called by webhook handler after handle_update() completes.
+    Executes all queued deletions (waits for their delay).
+    """
+    if not _pending_deletes:
+        return
+
+    # Sort by delete_at so shortest waits go first
+    _pending_deletes.sort(key=lambda x: x["delete_at"])
+
+    async def _delete_one(item: Dict) -> None:
+        now = time.time()
+        wait = max(0.0, item["delete_at"] - now)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        await tg("deleteMessage", {"chat_id": item["chat_id"], "message_id": item["message_id"]})
+
+    await asyncio.gather(*[_delete_one(item) for item in _pending_deletes])
+    _pending_deletes.clear()
+
+
+# ───────────────────────────────────────────────────────
+# Vercel AI Gateway — balance check
+# ───────────────────────────────────────────────────────
 
 async def check_balance(api_key: str) -> Optional[Dict[str, float]]:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                f"{VERCEL_GATEWAY}/credits",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                f"{GATEWAY_URL}/credits",
+                headers={"Authorization": f"Bearer {api_key}"},
             )
-            if resp.status_code == 200:
-                data = resp.json()
-                return {
-                    "balance": float(data.get("balance", 0)),
-                    "total_used": float(data.get("total_used", 0)),
-                }
+        if resp.status_code == 200:
+            d = resp.json()
+            return {"balance": float(d.get("balance", 0)), "total_used": float(d.get("total_used", 0))}
     except Exception:
         pass
     return None
 
 
-async def get_best_key(username: str) -> Optional[Dict[str, Any]]:
-    """Return the key with the highest balance."""
-    keys = await get_user_keys(username)
+async def best_key(username: str) -> Optional[Dict]:
+    """Key with highest balance."""
+    keys = await get_keys(username)
     if not keys:
         return None
-
-    balances = await asyncio.gather(*[check_balance(k) for k in keys])
+    bals = await asyncio.gather(*[check_balance(k) for k in keys])
     results = [
         {"key": k, "balance": b["balance"], "total_used": b["total_used"]}
-        for k, b in zip(keys, balances) if b is not None
+        for k, b in zip(keys, bals) if b is not None
     ]
     if not results:
         return None
-
     results.sort(key=lambda x: x["balance"], reverse=True)
     return results[0]
 
 
-async def get_all_balances(username: str) -> List[Dict[str, Any]]:
-    """Return balance info for all keys, sorted by balance descending."""
-    keys = await get_user_keys(username)
+async def all_balances(username: str) -> List[Dict]:
+    keys = await get_keys(username)
     if not keys:
         return []
-
-    balances = await asyncio.gather(*[check_balance(k) for k in keys])
-    results = []
-    for key, bal in zip(keys, balances):
-        results.append({
-            "key": key,
-            "masked": f"{key[:8]}...{key[-6:]}",
-            "balance": bal["balance"] if bal else None,
-            "total_used": bal["total_used"] if bal else None,
+    bals = await asyncio.gather(*[check_balance(k) for k in keys])
+    out = []
+    for k, b in zip(keys, bals):
+        out.append({
+            "key": k,
+            "masked": f"{k[:8]}...{k[-6:]}",
+            "balance": b["balance"] if b else None,
+            "total_used": b["total_used"] if b else None,
         })
-    results.sort(key=lambda x: (x["balance"] or -1), reverse=True)
-    return results
+    out.sort(key=lambda x: (x["balance"] or -1), reverse=True)
+    return out
 
 
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 # Telegram API helpers
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 
 async def tg(method: str, data: dict) -> dict:
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(f"{TELEGRAM_API}/{method}", json=data)
-        return resp.json()
+        r = await client.post(f"{TG_API}/{method}", json=data)
+    return r.json()
 
 
-async def send_message(chat_id: int, text: str, reply_markup=None, parse_mode="Markdown") -> Optional[int]:
+async def send(chat_id: int, text: str, markup=None, parse_mode="Markdown") -> Optional[int]:
     payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    resp = await tg("sendMessage", payload)
-    if resp.get("ok"):
-        return resp["result"]["message_id"]
+    if markup:
+        payload["reply_markup"] = markup
+    r = await tg("sendMessage", payload)
+    if r.get("ok"):
+        return r["result"]["message_id"]
     return None
 
 
-async def delete_message(chat_id: int, message_id: int) -> None:
-    await tg("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+async def answer_cb(cq_id: str, text: str = "") -> None:
+    await tg("answerCallbackQuery", {"callback_query_id": cq_id, "text": text})
 
 
-async def answer_callback(callback_query_id: str, text: str = "") -> None:
-    await tg("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
+# ───────────────────────────────────────────────────────
+# Access control
+# ───────────────────────────────────────────────────────
 
-
-async def delete_messages_later(chat_id: int, message_ids: List[int], delay: int = AUTO_DELETE_SECONDS) -> None:
-    await asyncio.sleep(delay)
-    for mid in message_ids:
-        try:
-            await delete_message(chat_id, mid)
-        except Exception:
-            pass
-
-
-# ─────────────────────────────────────────────
-# Access Control
-# ─────────────────────────────────────────────
-
-def is_allowed(username: Optional[str]) -> bool:
+def allowed(username: Optional[str]) -> bool:
     if not username:
         return False
     return username.lower().lstrip("@") in ALLOWED_USERS
 
 
-# ─────────────────────────────────────────────
-# Keyboard
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
+# Main keyboard
+# ───────────────────────────────────────────────────────
 
-def main_keyboard() -> dict:
+def main_kb() -> dict:
     return {
         "inline_keyboard": [
             [
-                {"text": "➕ Add Key", "callback_data": "btn_add"},
-                {"text": "📊 Total APIs", "callback_data": "btn_total"},
+                {"text": "➕ Add Key",    "callback_data": "add"},
+                {"text": "📊 Total APIs", "callback_data": "total"},
             ],
             [
-                {"text": "🗑 Remove Key", "callback_data": "btn_remove"},
-                {"text": "🔑 Get Best Key", "callback_data": "btn_get"},
+                {"text": "🗑 Remove Key",  "callback_data": "remove"},
+                {"text": "🔑 Get Best Key","callback_data": "get"},
             ],
             [
-                {"text": "📈 Dashboard", "callback_data": "btn_dashboard"},
+                {"text": "📈 Dashboard",  "callback_data": "dashboard"},
             ],
         ]
     }
 
 
-# ─────────────────────────────────────────────
-# Action Handlers
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
+# Button handlers
+# ───────────────────────────────────────────────────────
 
-async def handle_start(chat_id: int, username: str) -> None:
-    await clear_user_state(username)
-    text = (
+async def on_start(chat_id: int, username: str) -> None:
+    await clear_state(username)
+    await send(
+        chat_id,
         "👋 *Vercel API Manager*\n\n"
         "Securely manage your Vercel AI Gateway API keys.\n"
-        "Each key is encrypted and only accessible by you.\n\n"
-        "Select an action:"
+        "All keys are encrypted — only you can access yours.\n\n"
+        "Choose an action:",
+        markup=main_kb(),
     )
-    await send_message(chat_id, text, reply_markup=main_keyboard())
 
 
-async def handle_btn_add(chat_id: int, username: str, cq_id: str) -> None:
-    await answer_callback(cq_id)
-    await set_user_state(username, "awaiting_add")
-    prompt_id = await send_message(
+async def on_add(chat_id: int, username: str, cq_id: str) -> None:
+    await answer_cb(cq_id)
+    await set_state(username, "awaiting_add")
+    prompt_id = await send(
         chat_id,
-        "🔑 *Add API Key*\n\nSend your Vercel AI Gateway API key now.\n\n"
-        "Example: `vck_87yuw9Jj...`\n\n"
-        "_Your message will be deleted immediately after saving._",
+        "🔑 *Add API Key*\n\n"
+        "Send your Vercel AI Gateway API key now.\n"
+        "Format: `vck_...`\n\n"
+        "_Message will be deleted right after saving._",
     )
-    # Auto-delete prompt if user doesn't respond in 60s
-    asyncio.create_task(delete_messages_later(chat_id, [prompt_id], delay=60))
+    if prompt_id:
+        queue_delete(chat_id, [prompt_id], delay=60)
 
 
-async def handle_btn_total(chat_id: int, username: str, cq_id: str) -> None:
-    await answer_callback(cq_id)
-    keys = await get_user_keys(username)
-    count = len(keys)
-    text = (
+async def on_total(chat_id: int, username: str, cq_id: str) -> None:
+    await answer_cb(cq_id)
+    keys = await get_keys(username)
+    n = len(keys)
+    msg_id = await send(
+        chat_id,
         f"📊 *Total API Keys*\n\n"
-        f"You have *{count}* API key{'s' if count != 1 else ''} stored.\n\n"
-        f"_Auto-deletes in {AUTO_DELETE_SECONDS}s._"
+        f"You have *{n}* API key{'s' if n != 1 else ''} stored.\n\n"
+        f"_Auto-deletes in {AUTO_DEL_SEC}s._",
     )
-    msg_id = await send_message(chat_id, text)
     if msg_id:
-        asyncio.create_task(delete_messages_later(chat_id, [msg_id]))
+        queue_delete(chat_id, [msg_id], delay=AUTO_DEL_SEC)
 
 
-async def handle_btn_remove(chat_id: int, username: str, cq_id: str) -> None:
-    await answer_callback(cq_id)
-    await set_user_state(username, "awaiting_remove")
-    prompt_id = await send_message(
+async def on_remove(chat_id: int, username: str, cq_id: str) -> None:
+    await answer_cb(cq_id)
+    await set_state(username, "awaiting_remove")
+    prompt_id = await send(
         chat_id,
-        "🗑 *Remove API Key*\n\nSend the full API key you want to delete.\n\n"
-        "_Auto-deletes in 60s if no response._",
+        "🗑 *Remove API Key*\n\n"
+        "Send the full API key you want to delete.\n\n"
+        "_Prompt auto-deletes in 60s if no response._",
     )
-    asyncio.create_task(delete_messages_later(chat_id, [prompt_id], delay=60))
+    if prompt_id:
+        queue_delete(chat_id, [prompt_id], delay=60)
 
 
-async def handle_btn_get(chat_id: int, username: str, cq_id: str) -> None:
-    await answer_callback(cq_id, text="Checking balances...")
-    loading_id = await send_message(chat_id, "⏳ Fetching best key by balance...")
+async def on_get(chat_id: int, username: str, cq_id: str) -> None:
+    await answer_cb(cq_id, text="Checking balances…")
+    loading_id = await send(chat_id, "⏳ Finding best key by balance…")
 
-    best = await get_best_key(username)
-    to_delete = [loading_id] if loading_id else []
+    bk = await best_key(username)
+    to_del = [loading_id] if loading_id else []
 
-    if best is None:
-        result_id = await send_message(
+    if bk is None:
+        result_id = await send(
             chat_id,
-            "❌ No keys available or balance check failed.\nAdd keys using *Add Key*.",
+            "❌ No keys available or balance fetch failed.\n"
+            "Add keys using the *➕ Add Key* button.",
         )
     else:
-        text = (
+        result_id = await send(
+            chat_id,
             f"🔑 *Best Key (Highest Balance)*\n\n"
-            f"`{best['key']}`\n\n"
-            f"💰 Balance: *${best['balance']:.4f}*\n"
-            f"📉 Used: *${best['total_used']:.4f}*\n\n"
-            f"_Auto-deletes in {AUTO_DELETE_SECONDS}s._"
+            f"`{bk['key']}`\n\n"
+            f"💰 Balance : *${bk['balance']:.4f}*\n"
+            f"📉 Used    : *${bk['total_used']:.4f}*\n\n"
+            f"_Auto-deletes in {AUTO_DEL_SEC}s._",
         )
-        result_id = await send_message(chat_id, text)
-
     if result_id:
-        to_delete.append(result_id)
-    asyncio.create_task(delete_messages_later(chat_id, to_delete))
+        to_del.append(result_id)
+    queue_delete(chat_id, to_del, delay=AUTO_DEL_SEC)
 
 
-async def handle_btn_dashboard(chat_id: int, username: str, cq_id: str) -> None:
-    await answer_callback(cq_id, text="Loading dashboard...")
-    loading_id = await send_message(chat_id, "⏳ Building dashboard...")
+async def on_dashboard(chat_id: int, username: str, cq_id: str) -> None:
+    await answer_cb(cq_id, text="Loading dashboard…")
+    loading_id = await send(chat_id, "⏳ Building dashboard…")
 
-    all_data = await get_all_balances(username)
-    to_delete = [loading_id] if loading_id else []
+    data = await all_balances(username)
+    to_del = [loading_id] if loading_id else []
 
-    if not all_data:
-        result_id = await send_message(
+    if not data:
+        result_id = await send(
             chat_id,
-            "📈 *Dashboard*\n\nNo API keys stored yet.\nUse *Add Key* to get started.",
+            "📈 *Dashboard*\n\nNo API keys found.\n"
+            "Use *➕ Add Key* to get started.",
         )
     else:
-        total_balance = sum(d["balance"] or 0 for d in all_data)
-        total_used = sum(d["total_used"] or 0 for d in all_data)
-        reachable = sum(1 for d in all_data if d["balance"] is not None)
-        total_keys = len(all_data)
+        total_bal  = sum(d["balance"] or 0 for d in data)
+        total_used = sum(d["total_used"] or 0 for d in data)
+        reachable  = sum(1 for d in data if d["balance"] is not None)
+        n          = len(data)
 
         lines = [
-            "📈 *Vercel API Manager — Dashboard*",
-            "",
-            f"👤 User: @{username}",
-            f"🔢 Total Keys: *{total_keys}*",
-            f"✅ Reachable: *{reachable}/{total_keys}*",
-            f"💰 Total Balance: *${total_balance:.4f}*",
-            f"📉 Total Used: *${total_used:.4f}*",
-            "",
+            "📈 *Vercel API Manager — Dashboard*", "",
+            f"👤 User       : @{username}",
+            f"🔢 Total Keys : *{n}*",
+            f"✅ Reachable  : *{reachable}/{n}*",
+            f"💰 Total Bal  : *${total_bal:.4f}*",
+            f"📉 Total Used : *${total_used:.4f}*", "",
             "━━━━━━━━━━━━━━━━━━━━━━━",
-            "*Keys (sorted by balance)*",
-            "",
+            "*Keys — sorted by balance (high→low)*", "",
         ]
-        for i, d in enumerate(all_data, 1):
-            bal = f"${d['balance']:.4f}" if d["balance"] is not None else "N/A"
-            used = f"${d['total_used']:.4f}" if d["total_used"] is not None else "N/A"
+        for i, d in enumerate(data, 1):
             icon = "🟢" if d["balance"] is not None else "🔴"
+            bal  = f"${d['balance']:.4f}"  if d["balance"]    is not None else "N/A"
+            used = f"${d['total_used']:.4f}" if d["total_used"] is not None else "N/A"
             lines += [
                 f"{icon} *#{i}* `{d['masked']}`",
-                f"   Balance: {bal} | Used: {used}",
-                "",
+                f"   Balance: {bal}  |  Used: {used}", "",
             ]
-
-        lines.append(f"_Auto-deletes in {AUTO_DELETE_SECONDS}s._")
-        result_id = await send_message(chat_id, "\n".join(lines))
+        lines.append(f"_Auto-deletes in {AUTO_DEL_SEC}s._")
+        result_id = await send(chat_id, "\n".join(lines))
 
     if result_id:
-        to_delete.append(result_id)
-    asyncio.create_task(delete_messages_later(chat_id, to_delete))
+        to_del.append(result_id)
+    queue_delete(chat_id, to_del, delay=AUTO_DEL_SEC)
 
 
-# ─────────────────────────────────────────────
-# Text Message Handler (state machine)
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
+# Text input handler (state machine)
+# ───────────────────────────────────────────────────────
 
-async def handle_user_text(chat_id: int, username: str, text: str, user_msg_id: int) -> None:
-    state = await get_user_state(username)
+async def on_text(chat_id: int, username: str, text: str, user_msg_id: int) -> None:
+    state = await get_state(username)
     if not state:
-        return  # Ignore messages outside of a flow
+        return
 
-    await clear_user_state(username)
+    await clear_state(username)
 
     if state == "awaiting_add":
         api_key = text.strip()
-        if not api_key.startswith("vck_") or len(api_key) < 20:
-            err_id = await send_message(
+        if not (api_key.startswith("vck_") and len(api_key) >= 20):
+            err_id = await send(
                 chat_id,
-                "❌ Invalid format. Vercel AI Gateway keys start with `vck_`.",
+                "❌ Invalid format.\n"
+                "Vercel AI Gateway keys start with `vck_` and are 60+ chars.",
             )
-            asyncio.create_task(delete_messages_later(chat_id, [user_msg_id, err_id]))
+            queue_delete(chat_id, [user_msg_id] + ([err_id] if err_id else []), delay=ADD_DEL_SEC)
             return
 
-        added = await add_user_key(username, api_key)
-        msg = "✅ *Done!* API key saved and encrypted." if added else "⚠️ This key already exists."
-        done_id = await send_message(chat_id, msg)
-        asyncio.create_task(delete_messages_later(chat_id, [user_msg_id, done_id], delay=3))
+        added = await add_key(username, api_key)
+        msg = "✅ *Done!* API key saved and encrypted." if added else "⚠️ Key already exists."
+        done_id = await send(chat_id, msg)
+        queue_delete(chat_id, [user_msg_id] + ([done_id] if done_id else []), delay=ADD_DEL_SEC)
 
     elif state == "awaiting_remove":
         api_key = text.strip()
-        removed = await remove_user_key(username, api_key)
+        removed = await remove_key(username, api_key)
         msg = "✅ *Done!* API key removed." if removed else "❌ Key not found in your vault."
-        done_id = await send_message(chat_id, msg)
-        asyncio.create_task(delete_messages_later(chat_id, [user_msg_id, done_id]))
+        done_id = await send(chat_id, msg)
+        queue_delete(chat_id, [user_msg_id] + ([done_id] if done_id else []), delay=AUTO_DEL_SEC)
 
 
-# ─────────────────────────────────────────────
-# Update Router
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
+# Main dispatcher
+# ───────────────────────────────────────────────────────
+
+BUTTON_MAP = {
+    "add":       on_add,
+    "total":     on_total,
+    "remove":    on_remove,
+    "get":       on_get,
+    "dashboard": on_dashboard,
+}
+
 
 async def handle_update(update: dict) -> None:
-    """Main entry point for all Telegram updates."""
-
-    # Callback query (button press)
+    # ── Callback query ──────────────────────────────
     if "callback_query" in update:
-        cq = update["callback_query"]
-        chat_id: int = cq["message"]["chat"]["id"]
-        cq_id: str = cq["id"]
-        username: str = cq["from"].get("username", "")
+        cq       = update["callback_query"]
+        chat_id  = cq["message"]["chat"]["id"]
+        cq_id    = cq["id"]
+        username = cq["from"].get("username", "")
 
-        if not is_allowed(username):
-            await answer_callback(cq_id, text="Access denied.")
+        if not allowed(username):
+            await answer_cb(cq_id, text="Access denied.")
             return
 
-        data = cq.get("data", "")
-        dispatch = {
-            "btn_add": handle_btn_add,
-            "btn_total": handle_btn_total,
-            "btn_remove": handle_btn_remove,
-            "btn_get": handle_btn_get,
-            "btn_dashboard": handle_btn_dashboard,
-        }
-        handler = dispatch.get(data)
-        if handler:
-            await handler(chat_id, username, cq_id)
+        fn = BUTTON_MAP.get(cq.get("data", ""))
+        if fn:
+            await fn(chat_id, username, cq_id)
         else:
-            await answer_callback(cq_id)
+            await answer_cb(cq_id)
         return
 
-    # Regular text message
+    # ── Text message ────────────────────────────────
     if "message" in update:
-        msg = update["message"]
-        chat_id = msg["chat"]["id"]
-        message_id: int = msg["message_id"]
+        msg      = update["message"]
+        chat_id  = msg["chat"]["id"]
+        msg_id   = msg["message_id"]
         username = msg.get("from", {}).get("username", "")
-        text: str = msg.get("text", "")
+        text     = msg.get("text", "")
 
-        if not is_allowed(username):
-            return  # Silent reject
+        if not allowed(username):
+            return  # silent
 
         if text.startswith("/start"):
-            await handle_start(chat_id, username)
+            await on_start(chat_id, username)
         elif text:
-            await handle_user_text(chat_id, username, text, message_id)
+            await on_text(chat_id, username, text, msg_id)
