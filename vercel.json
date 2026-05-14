@@ -1,22 +1,18 @@
 {
   "version": 2,
   "builds": [
-    {
-      "src": "api/webhook.py",
-      "use": "@vercel/python",
-      "config": {
-        "maxLambdaSize": "15mb"
-      }
-    }
+    { "src": "api/webhook.py", "use": "@vercel/python" },
+    { "src": "api/tick.py",    "use": "@vercel/python" }
   ],
   "routes": [
+    { "src": "/api/webhook", "dest": "api/webhook.py" },
+    { "src": "/api/tick",    "dest": "api/tick.py"    },
+    { "src": "/",            "dest": "api/webhook.py" }
+  ],
+  "crons": [
     {
-      "src": "/api/webhook",
-      "dest": "api/webhook.py"
-    },
-    {
-      "src": "/",
-      "dest": "api/webhook.py"
+      "path": "/api/tick",
+      "schedule": "*/1 * * * *"
     }
   ]
 }
