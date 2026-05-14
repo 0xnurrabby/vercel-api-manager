@@ -277,13 +277,29 @@ def reply_kb() -> dict:
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 async def on_start(cl: httpx.AsyncClient, chat_id: int, username: str, user_msg_id: int) -> None:
-    # Run state clear + user register + /start message delete in parallel
     import asyncio
-    await asyncio.gather(
-        clear_state(cl, username),
-        kv_sadd(cl, "vam:users", _uh(username)),
-        delete_msg(cl, chat_id, user_msg_id),
-    )
+
+    # Safe parallel cleanup — errors ignored so new users never crash here
+    async def _safe_clear():
+        try:
+            await clear_state(cl, username)
+        except Exception:
+            pass
+
+    async def _safe_register():
+        try:
+            await kv_sadd(cl, "vam:users", _uh(username))
+        except Exception:
+            pass
+
+    async def _safe_delete_user_msg():
+        try:
+            await delete_msg(cl, chat_id, user_msg_id)
+        except Exception:
+            pass
+
+    await asyncio.gather(_safe_clear(), _safe_register(), _safe_delete_user_msg())
+
     await send(
         cl, chat_id,
         "🔐 *Vercel API Manager*\n"
@@ -478,23 +494,31 @@ async def handle_update(update: dict) -> None:
     if not allowed(username):
         return
 
-    # Single shared client for the entire request — all calls reuse connection
-    async with _client() as cl:
-        if text.startswith("/start"):
-            await on_start(cl, chat_id, username, msg_id)
-            return
+    try:
+        # Single shared client for the entire request
+        async with _client() as cl:
+            if text.startswith("/start"):
+                await on_start(cl, chat_id, username, msg_id)
+                return
 
-        handlers = {
-            BTN_ADD:       on_add,
-            BTN_TOTAL:     on_total,
-            BTN_REMOVE:    on_remove,
-            BTN_GET:       on_get,
-            BTN_DASHBOARD: on_dashboard,
-        }
-        fn = handlers.get(text)
-        if fn:
-            await fn(cl, chat_id, username, msg_id)
-            return
+            handlers = {
+                BTN_ADD:       on_add,
+                BTN_TOTAL:     on_total,
+                BTN_REMOVE:    on_remove,
+                BTN_GET:       on_get,
+                BTN_DASHBOARD: on_dashboard,
+            }
+            fn = handlers.get(text)
+            if fn:
+                await fn(cl, chat_id, username, msg_id)
+                return
 
-        if text:
-            await on_text(cl, chat_id, username, text, msg_id)
+            if text:
+                await on_text(cl, chat_id, username, text, msg_id)
+    except Exception:
+        # Never crash silently — try to send a fallback message
+        try:
+            async with _client() as cl:
+                await send(cl, chat_id, "Something went wrong. Please try /start again.")
+        except Exception:
+            pass
