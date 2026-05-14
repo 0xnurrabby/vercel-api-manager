@@ -270,8 +270,6 @@ def dash_page(data, page, total_pages, total_bal, total_used, reachable, usernam
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 async def on_start(cl, chat_id: int, u: str) -> None:
-    # /start does NOT clear previous messages — keyboard stays,
-    # but we do register the user and reset state
     try:
         await asyncio.gather(
             clear_state(cl, u),
@@ -279,7 +277,9 @@ async def on_start(cl, chat_id: int, u: str) -> None:
         )
     except Exception:
         pass
-    mid = await send(cl, chat_id,
+    # Send welcome — do NOT track this message so it never gets deleted.
+    # The reply_kb() attached here persists at chat level.
+    await send(cl, chat_id,
         "🔐 *Vercel API Manager*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "Welcome, @" + u + "!\n\n"
@@ -293,7 +293,7 @@ async def on_start(cl, chat_id: int, u: str) -> None:
         "Select an option from the menu below:",
         markup=reply_kb(),
     )
-    await _track(cl, u, chat_id, mid)
+    # DO NOT _track — this message must never be deleted
 
 
 async def on_add(cl, chat_id: int, u: str, user_msg_id: int) -> None:
@@ -306,6 +306,7 @@ async def on_add(cl, chat_id: int, u: str, user_msg_id: int) -> None:
         "Send your Vercel AI Gateway API key now.\n"
         "Format: `vck_...`\n\n"
         "_Your key message will be deleted right after saving._",
+        markup=reply_kb(),
     )
     await _track(cl, u, chat_id, mid, user_msg_id)
 
@@ -320,6 +321,7 @@ async def on_total(cl, chat_id: int, u: str, user_msg_id: int) -> None:
         f"📊 *Total API Keys*\n\n"
         f"You have *{n}* API key{'s' if n != 1 else ''} stored.\n\n"
         "_Clears on next action._",
+        markup=reply_kb(),
     )
     await _track(cl, u, chat_id, mid, user_msg_id)
 
@@ -333,6 +335,7 @@ async def on_remove(cl, chat_id: int, u: str, user_msg_id: int) -> None:
         "🗑 *Remove API Key*\n\n"
         "Send the full API key you want to delete.\n\n"
         "_Your message will be deleted after action._",
+        markup=reply_kb(),
     )
     await _track(cl, u, chat_id, mid, user_msg_id)
 
@@ -348,14 +351,16 @@ async def on_get(cl, chat_id: int, u: str, user_msg_id: int) -> None:
     if bk is None:
         mid = await send(cl, chat_id,
             "❌ No keys available or balance check failed.\n"
-            "Add keys first using *Add Key*.")
+            "Add keys first using *Add Key*.",
+            markup=reply_kb())
     else:
         mid = await send(cl, chat_id,
             f"🔑 *Best Key — Highest Balance*\n\n"
             f"`{bk['key']}`\n\n"
             f"💰 Balance : *${bk['balance']:.4f}*\n"
             f"📉 Used    : *${bk['used']:.4f}*\n\n"
-            "_Clears on next action._")
+            "_Clears on next action._",
+            markup=reply_kb())
     await _track(cl, u, chat_id, mid, user_msg_id)
 
 
@@ -369,7 +374,8 @@ async def on_dashboard(cl, chat_id: int, u: str, user_msg_id: int, page: int = 1
 
     if not data:
         mid = await send(cl, chat_id,
-            "📈 *Dashboard*\n\nNo API keys found.\nUse *Add Key* to get started.")
+            "📈 *Dashboard*\n\nNo API keys found.\nUse *Add Key* to get started.",
+            markup=reply_kb())
         await _track(cl, u, chat_id, mid, user_msg_id)
         return
 
@@ -379,11 +385,11 @@ async def on_dashboard(cl, chat_id: int, u: str, user_msg_id: int, page: int = 1
     total_pages = max(1, (len(data) + PAGE_SIZE - 1) // PAGE_SIZE)
     page        = max(1, min(page, total_pages))
 
+    # Dashboard uses dash_nav_kb inline — reply_kb stays as persistent bottom bar
     text = dash_page(data, page, total_pages, total_bal, total_used, reachable, u)
     mid  = await send(cl, chat_id, text, markup=dash_nav_kb(page, total_pages))
     await _track(cl, u, chat_id, mid, user_msg_id)
 
-    # Cache for Prev/Next navigation
     await kv_setex(cl, _kdash(u), 300, json.dumps({
         "data": data, "total_bal": total_bal, "total_used": total_used,
         "reachable": reachable, "total_pages": total_pages,
@@ -401,6 +407,7 @@ async def on_copy(cl, chat_id: int, u: str, user_msg_id: int) -> None:
         "Send the *prefix* shown in the dashboard.\n"
         "Example: `vck_4b0e`\n\n"
         "_Your message will be deleted after lookup._",
+        markup=reply_kb(),
     )
     await _track(cl, u, chat_id, mid, user_msg_id)
 
@@ -448,7 +455,7 @@ async def handle_callback(cl, chat_id: int, u: str, msg_id: int,
         )
         keys = await get_keys(cl, u)
         if not keys:
-            mid = await send(cl, chat_id, "❌ No keys to export.")
+            mid = await send(cl, chat_id, "❌ No keys to export.", markup=reply_kb())
             await _track(cl, u, chat_id, mid)
             return
         content = "\n".join(keys).encode("utf-8")
@@ -481,20 +488,22 @@ async def on_text(cl, chat_id: int, u: str, text: str, user_msg_id: int) -> None
         if not (key.startswith("vck_") and len(key) >= 20):
             mid = await send(cl, chat_id,
                 "❌ Invalid format.\n"
-                "Vercel keys start with `vck_` and are 60+ chars.")
+                "Vercel keys start with `vck_` and are 60+ chars.",
+                markup=reply_kb())
             await _track(cl, u, chat_id, mid, user_msg_id)
             return
         ok  = await add_key(cl, u, key)
         mid = await send(cl, chat_id,
-            "✅ *Done!* Key saved and encrypted." if ok else "⚠️ Key already exists.")
-        # Track only done message — user's key message already deleted via _clear_all
+            "✅ *Done!* Key saved and encrypted." if ok else "⚠️ Key already exists.",
+            markup=reply_kb())
         await _track(cl, u, chat_id, mid, user_msg_id)
 
     elif state == "awaiting_remove":
         key = text.strip()
         ok  = await remove_key(cl, u, key)
         mid = await send(cl, chat_id,
-            "✅ *Done!* API key removed." if ok else "❌ Key not found in your vault.")
+            "✅ *Done!* API key removed." if ok else "❌ Key not found in your vault.",
+            markup=reply_kb())
         await _track(cl, u, chat_id, mid, user_msg_id)
 
     elif state == "awaiting_copy":
@@ -504,7 +513,8 @@ async def on_text(cl, chat_id: int, u: str, text: str, user_msg_id: int) -> None
         if match is None:
             mid = await send(cl, chat_id,
                 f"❌ No key found starting with `{prefix}`.\n"
-                "Check the prefix from the dashboard.")
+                "Check the prefix from the dashboard.",
+                markup=reply_kb())
         else:
             bal  = await check_balance(cl, match)
             bstr = f"${bal['balance']:.4f}" if bal else "N/A"
@@ -514,12 +524,12 @@ async def on_text(cl, chat_id: int, u: str, text: str, user_msg_id: int) -> None
                 f"`{match}`\n\n"
                 f"💰 Balance : *{bstr}*\n"
                 f"📉 Used    : *{ustr}*\n\n"
-                "_Clears on next action._")
+                "_Clears on next action._",
+                markup=reply_kb())
         await _track(cl, u, chat_id, mid, user_msg_id)
 
     elif state == "awaiting_export_confirm":
-        # User typed instead of tapping button — just clear
-        pass
+        pass  # user typed instead of tapping button — just clear
 
 
 # ── Main dispatcher ───────────────────────────────────────────────────────────
