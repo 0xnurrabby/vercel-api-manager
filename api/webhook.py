@@ -21,10 +21,18 @@ class handler(BaseHTTPRequestHandler):
 
             self._ok({"ok": True})
         except Exception as e:
-            self._err(str(e))
+            import traceback
+            self._ok({"ok": True, "internal_error": str(e), "trace": traceback.format_exc()})
 
     def do_GET(self):
-        self._ok({"status": "Vercel API Manager Bot running"})
+        # Show allowed users for debugging (masked)
+        allowed_raw = os.environ.get("ALLOWED_TELEGRAM_USERS", "NOT SET")
+        self._ok({
+            "status": "Vercel API Manager Bot running",
+            "allowed_users_set": bool(allowed_raw and allowed_raw != "NOT SET"),
+            "kv_url_set": bool(os.environ.get("KV_REST_API_URL") or os.environ.get("UPSTASH_REDIS_REST_URL")),
+            "kv_token_set": bool(os.environ.get("KV_REST_API_TOKEN") or os.environ.get("UPSTASH_REDIS_REST_TOKEN")),
+        })
 
     def _ok(self, body: dict):
         self.send_response(200)
