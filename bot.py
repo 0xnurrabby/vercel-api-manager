@@ -422,6 +422,11 @@ async def handle_update(update: dict) -> None:
     if not allowed(username):
         return  # silent reject
 
+    # ── Process any pending auto-deletes FIRST (on every interaction) ─────────
+    # This is the serverless-safe way: delete due messages at the start of
+    # the next request instead of waiting in a background coroutine.
+    await process_delete_queue(username)
+
     # /start command
     if text.startswith("/start"):
         await on_start(chat_id, username, msg_id)
