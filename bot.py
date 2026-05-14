@@ -286,10 +286,17 @@ async def on_start(cl: httpx.AsyncClient, chat_id: int, username: str, user_msg_
     )
     await send(
         cl, chat_id,
-        "👋 *Vercel API Manager*\n\n"
-        "Manage your Vercel AI Gateway API keys securely.\n"
-        "Your keys are *encrypted* — only you can access them.\n\n"
-        "Use the buttons below:",
+        "🔐 *Vercel API Manager*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Welcome, @" + username + "!\n\n"
+        "This bot helps you manage your *Vercel AI Gateway*\n"
+        "API keys safely and efficiently.\n\n"
+        "✦ Keys are *AES-256 encrypted*\n"
+        "✦ Only *you* can access your keys\n"
+        "✦ Always gets the *highest balance* key\n"
+        "✦ Messages *auto-delete* for privacy\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Select an option from the menu below:",
         markup=reply_kb(),
     )
 
