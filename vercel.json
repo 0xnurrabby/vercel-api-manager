@@ -8,11 +8,5 @@
     { "src": "/api/webhook", "dest": "api/webhook.py" },
     { "src": "/api/tick",    "dest": "api/tick.py"    },
     { "src": "/",            "dest": "api/webhook.py" }
-  ],
-  "crons": [
-    {
-      "path": "/api/tick",
-      "schedule": "0 * * * *"
-    }
   ]
 }
