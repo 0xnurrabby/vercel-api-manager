@@ -1,5 +1,5 @@
 """
-Webhook handler — receives Telegram updates via POST /api/webhook
+Webhook handler — POST /api/webhook
 """
 import json, asyncio, sys, os
 from http.server import BaseHTTPRequestHandler
@@ -19,31 +19,18 @@ class handler(BaseHTTPRequestHandler):
             loop.run_until_complete(handle_update(update))
             loop.close()
 
-            self._ok({"ok": True})
+            self._respond(200, {"ok": True})
         except Exception as e:
-            import traceback
-            self._ok({"ok": True, "internal_error": str(e), "trace": traceback.format_exc()})
+            # Always return 200 to Telegram so it doesn't retry
+            self._respond(200, {"ok": True, "err": str(e)})
 
     def do_GET(self):
-        # Show allowed users for debugging (masked)
-        allowed_raw = os.environ.get("ALLOWED_TELEGRAM_USERS", "NOT SET")
-        self._ok({
-            "status": "Vercel API Manager Bot running",
-            "allowed_users_set": bool(allowed_raw and allowed_raw != "NOT SET"),
-            "kv_url_set": bool(os.environ.get("KV_REST_API_URL") or os.environ.get("UPSTASH_REDIS_REST_URL")),
-            "kv_token_set": bool(os.environ.get("KV_REST_API_TOKEN") or os.environ.get("UPSTASH_REDIS_REST_TOKEN")),
-        })
+        self._respond(200, {"status": "running"})
 
-    def _ok(self, body: dict):
-        self.send_response(200)
+    def _respond(self, code: int, body: dict):
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(body).encode())
-
-    def _err(self, msg: str):
-        self.send_response(500)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"ok": False, "error": msg}).encode())
 
     def log_message(self, *_): pass
