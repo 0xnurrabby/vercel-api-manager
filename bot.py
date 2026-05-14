@@ -279,26 +279,14 @@ def reply_kb() -> dict:
 async def on_start(cl: httpx.AsyncClient, chat_id: int, username: str, user_msg_id: int) -> None:
     import asyncio
 
-    # Safe parallel cleanup — errors ignored so new users never crash here
-    async def _safe_clear():
-        try:
-            await clear_state(cl, username)
-        except Exception:
-            pass
-
-    async def _safe_register():
-        try:
-            await kv_sadd(cl, "vam:users", _uh(username))
-        except Exception:
-            pass
-
-    async def _safe_delete_user_msg():
-        try:
-            await delete_msg(cl, chat_id, user_msg_id)
-        except Exception:
-            pass
-
-    await asyncio.gather(_safe_clear(), _safe_register(), _safe_delete_user_msg())
+    # Just clear state and register user — do NOT delete the /start message
+    try:
+        await asyncio.gather(
+            clear_state(cl, username),
+            kv_sadd(cl, "vam:users", _uh(username)),
+        )
+    except Exception:
+        pass
 
     await send(
         cl, chat_id,
